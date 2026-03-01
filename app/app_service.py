@@ -36,6 +36,7 @@ try:
     from ..core.dtos import TranslationJobProgressDTO, GlossaryExtractionProgressDTO
     from ..utils.post_processing_service import PostProcessingService
     from ..utils.quality_check_service import QualityCheckService
+    from ..utils.prefix_service import PrefixService
 except ImportError:
     # Fallback imports
     from infrastructure.file_handler import (
@@ -56,6 +57,7 @@ except ImportError:
     from core.dtos import TranslationJobProgressDTO, GlossaryExtractionProgressDTO
     from utils.post_processing_service import PostProcessingService
     from utils.quality_check_service import QualityCheckService
+    from utils.prefix_service import PrefixService
 
 logger = setup_logger(__name__)
 
@@ -92,6 +94,7 @@ class AppService:
         self.failed_chunks_count = 0
         self.post_processing_service = PostProcessingService()
         self.quality_check_service = QualityCheckService()
+        self.prefix_service = PrefixService()
 
         self.load_app_config()
 
@@ -983,7 +986,17 @@ class AppService:
         if not chunks:
             logger.info("처리할 청크가 없습니다")
             return
-        
+
+        # 프리픽스 추적 모드: 청크별 원본 파일 기준 줄 번호 오프셋 사전 계산
+        # chunks는 (chunk_index, chunk_text) 형태이며, chunk_index 순으로 정렬하여 누적
+        line_offsets: Dict[int, int] = {}
+        if self.config.get("enable_prefix_tracking", False):
+            cumulative = 0
+            for cidx, ctext in sorted(chunks, key=lambda x: x[0]):
+                line_offsets[cidx] = cumulative
+                cumulative += self.prefix_service.count_chunk_lines(ctext)
+            logger.info(f"프리픽스 추적 모드: 총 {cumulative}줄에 대한 오프셋 계산 완료")
+
         max_workers = self.config.get("max_workers", 4)
         rpm = self.config.get("requests_per_minute", 60)
         
@@ -1056,7 +1069,8 @@ class AppService:
                     total_chunks,
                     metadata_file_path,
                     input_file_path,
-                    progress_callback
+                    progress_callback,
+                    global_line_offset=line_offsets.get(chunk_index, 0)
                 )
         
         # Task 리스트 생성
@@ -1113,7 +1127,8 @@ class AppService:
         total_chunks: int,
         metadata_file_path: Path,
         input_file_path: Path,
-        progress_callback: Optional[Callable[[TranslationJobProgressDTO], None]] = None
+        progress_callback: Optional[Callable[[TranslationJobProgressDTO], None]] = None,
+        global_line_offset: int = 0
     ) -> bool:
         """
         비동기 청크 처리 (동기 버전과 동일한 로깅 구조)
@@ -1158,12 +1173,33 @@ class AppService:
                 logger.debug(f"  ⚙️ 설정: 모델={model_name}, 타임아웃=300초")
             
             translation_start_time = time.time()
-            
+
+            # 프리픽스 추적 모드: 번역 전 프리픽스 추가
+            enable_prefix = self.config.get("enable_prefix_tracking", False)
+            line_metadata = None
+            if enable_prefix:
+                prefixed_text, line_metadata = self.prefix_service.add_prefixes_to_chunk(
+                    chunk_text, global_line_offset
+                )
+                text_to_translate = prefixed_text
+                logger.debug(f"  [프리픽스] {chunk_index + 1}번 청크에 번호 부착 완료 (offset={global_line_offset})")
+            else:
+                text_to_translate = chunk_text
+
             # 비동기 번역 호출 (timeout은 GeminiClient의 http_options에 의해 자동 적용)
             try:
-                translated_chunk = await self.translation_service.translate_chunk_async(
-                    chunk_text
+                raw_translated = await self.translation_service.translate_chunk_async(
+                    text_to_translate
                 )
+
+                # 프리픽스 추적 모드: 번역 결과 파싱 및 재구성
+                if enable_prefix and line_metadata is not None:
+                    translated_map = self.prefix_service.parse_prefixed_translation(raw_translated)
+                    translated_chunk = self.prefix_service.reconstruct_output(line_metadata, translated_map)
+                    logger.debug(f"  [프리픽스] {chunk_index + 1}번 청크 재구성 완료 ({len(translated_map)}개 매칭)")
+                else:
+                    translated_chunk = raw_translated
+
                 success = True
                 
                 translation_time = time.time() - translation_start_time

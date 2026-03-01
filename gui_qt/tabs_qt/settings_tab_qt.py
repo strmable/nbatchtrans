@@ -382,6 +382,20 @@ class SettingsTabQt(QtWidgets.QWidget):
         safety_form.addRow("최대 분할 시도", self.max_split_spin)
         safety_form.addRow("최소 청크 크기", self.min_chunk_spin)
 
+        # --- 번역 완전성 검증 (프리픽스 추적) ---
+        prefix_group = QtWidgets.QGroupBox("번역 완전성 검증 (프리픽스 추적)")
+        prefix_vbox = QtWidgets.QVBoxLayout(prefix_group)
+        self.enable_prefix_tracking_check = QtWidgets.QCheckBox("프리픽스 기반 번역 누락 감지 사용")
+        TooltipQt(
+            self.enable_prefix_tracking_check,
+            "각 문장 앞에 [00001] 형식의 번호를 붙여 번역합니다.\n"
+            "번역 누락 문장은 원문으로 대체되며,\n"
+            "@offset::줄번호 형태의 주석으로 표시됩니다.\n"
+            "수동 번역 보완 작업에 활용할 수 있습니다.\n\n"
+            "※ 번역 결과에 프리픽스가 전혀 없으면 즉시 오류로 중단됩니다."
+        )
+        prefix_vbox.addWidget(self.enable_prefix_tracking_check)
+
         # --- 액션/진행 표시 ---
         self.start_btn = QtWidgets.QPushButton("번역 시작")
         TooltipQt(self.start_btn, "현재 설정으로 번역을 시작합니다.")
@@ -411,6 +425,7 @@ class SettingsTabQt(QtWidgets.QWidget):
         layout.addWidget(prompt_group)
         layout.addWidget(prefill_group)
         layout.addWidget(safety_group)
+        layout.addWidget(prefix_group)
         layout.addLayout(btn_row)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
@@ -597,6 +612,10 @@ class SettingsTabQt(QtWidgets.QWidget):
         self.max_split_spin.setValue(int(cfg.get("max_content_safety_split_attempts", defaults.get("max_content_safety_split_attempts", 3))))
         self.min_chunk_spin.setValue(int(cfg.get("min_content_safety_chunk_size", defaults.get("min_content_safety_chunk_size", 100))))
 
+        self.enable_prefix_tracking_check.setChecked(
+            bool(cfg.get("enable_prefix_tracking", defaults.get("enable_prefix_tracking", False)))
+        )
+
     def _save_config_to_service(self) -> None:
         # 서비스의 설정을 직접 수정하지 않도록 복사본 생성 (Deep Copy 권장)
         raw_config = getattr(self.app_service, "config", {}) or {}
@@ -632,6 +651,7 @@ class SettingsTabQt(QtWidgets.QWidget):
         cfg["use_content_safety_retry"] = self.use_content_safety_check.isChecked()
         cfg["max_content_safety_split_attempts"] = int(self.max_split_spin.value())
         cfg["min_content_safety_chunk_size"] = int(self.min_chunk_spin.value())
+        cfg["enable_prefix_tracking"] = self.enable_prefix_tracking_check.isChecked()
         # self.app_service.config = cfg  # 직접 할당 제거 (save_app_config 내부에서 처리됨)
         try:
             self.app_service.save_app_config(cfg)

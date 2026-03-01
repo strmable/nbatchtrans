@@ -172,6 +172,13 @@ class TranslationService:
             logger.info(f"용어집 JSON 파일({lorebook_json_path_str})이 설정되지 않았거나 존재하지 않습니다. 동적 주입을 위해 용어집을 사용하지 않습니다.") # 메시지 변경
             self.glossary_entries_for_injection = []
 
+    _PREFIX_INSTRUCTION = (
+        "[번역 지시 - 프리픽스 보존]\n"
+        "각 줄 앞에 [NNNNN] 형식의 5자리 번호가 붙어 있습니다.\n"
+        "번역 결과에도 동일한 번호를 그대로 유지하여 출력하세요.\n"
+        "번호를 절대 생략하거나 변경하지 마세요. 빈 줄은 그대로 빈 줄로 유지하세요.\n\n"
+    )
+
     def _construct_prompt(self, chunk_text: str) -> str:
         prompt_template = self.config.get("prompts", "Translate to Korean: {{slot}}")
         if isinstance(prompt_template, (list, tuple)):
@@ -186,6 +193,11 @@ class TranslationService:
             raise BtgTranslationException("동적 용어집 주입이 활성화되었으나, 프롬프트 템플릿에 '{{glossary_context}}' 플레이스홀더가 없습니다. 작업을 중단합니다.")
 
         final_prompt = prompt_template
+
+        # [프리픽스 추적 모드] 프리픽스 보존 지시문 자동 삽입
+        if self.config.get("enable_prefix_tracking", False):
+            final_prompt = self._PREFIX_INSTRUCTION + final_prompt
+            logger.debug("프리픽스 보존 지시문을 프롬프트 앞에 삽입했습니다.")
 
         # Determine the source language for the current chunk to filter glossary entries
         config_source_lang = self.config.get("novel_language") # 통합된 설정 사용

@@ -175,6 +175,9 @@ class ConfigManager:
             "max_glossary_entries_per_chunk_injection": 3,
             "max_glossary_chars_per_chunk_injection": 500,
 
+            # 프리픽스 기반 번역 완전성 검증
+            "enable_prefix_tracking": False,
+
             # API 설정
             "api_timeout": 1000.0, # API 호출 타임아웃 (초)
         }

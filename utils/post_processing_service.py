@@ -43,6 +43,10 @@ class PostProcessingService:
             
             # 기타 정리 패턴들 - Non-capturing groups 적용
             r'(?:```)',
+
+            # 프리픽스 추적 모드 잔여 마커 안전망
+            # (PrefixService가 정상 처리했다면 남지 않지만, 혹시 LLM이 일부 그대로 반환한 경우 대비)
+            r'^\[\d{5}\]',
         ]
 
         # [참고] 기존 self.html_cleanup_patterns는 clean_translated_content 내의 새로운 로직으로 대체되었으므로 사용되지 않을 수 있습니다.

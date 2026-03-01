@@ -149,7 +149,7 @@ class ReviewTabQt(QtWidgets.QWidget):
 
         btns = QtWidgets.QVBoxLayout()
         self.retranslate_btn = QtWidgets.QPushButton("재번역")
-        TooltipQt(self.retranslate_btn, "선택한 청크를 다시 번역합니다.")
+        TooltipQt(self.retranslate_btn, "선택한 하나 이상의 청크를 다시 번역합니다. Ctrl/Shift 클릭으로 다중 선택 가능합니다.")
         self.edit_btn = QtWidgets.QPushButton("수동 수정")
         TooltipQt(self.edit_btn, "선택한 청크의 번역을 수동으로 수정합니다.")
         self.reset_btn = QtWidgets.QPushButton("초기화")
@@ -598,8 +598,9 @@ class ReviewTabQt(QtWidgets.QWidget):
     # ---------- actions ----------
     @asyncSlot()
     async def _on_retranslate_clicked(self) -> None:
-        chunk_idx = self._selected_index_single()
-        if chunk_idx is None or not self.current_input_file:
+        indices = self._selected_indices()
+        if not indices or not self.current_input_file:
+            QtWidgets.QMessageBox.warning(self, "경고", "청크를 선택하세요.")
             return
         if not self.app_service or not self.app_service.translation_service:
             QtWidgets.QMessageBox.critical(self, "오류", "번역 서비스가 초기화되지 않았습니다.")
@@ -607,39 +608,60 @@ class ReviewTabQt(QtWidgets.QWidget):
         if self.app_service.current_translation_task and not self.app_service.current_translation_task.done():
             QtWidgets.QMessageBox.warning(self, "경고", "현재 번역 작업이 진행 중입니다. 완료 후 시도하세요.")
             return
-        if QtWidgets.QMessageBox.question(
-            self,
-            "재번역 확인",
-            f"청크 #{chunk_idx}를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다.",
-        ) != QtWidgets.QMessageBox.Yes:
+
+        n = len(indices)
+        if n == 1:
+            prompt = f"청크 #{indices[0]}를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다."
+        else:
+            preview = ", ".join(f"#{i}" for i in indices[:5])
+            if n > 5:
+                preview += "..."
+            prompt = f"선택한 {n}개 청크({preview})를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다."
+        if QtWidgets.QMessageBox.question(self, "재번역 확인", prompt) != QtWidgets.QMessageBox.Yes:
             return
 
         self._set_busy(True)
-        self._set_status(f"청크 #{chunk_idx} 재번역 중...")
-
-        def task() -> Tuple[bool, str]:
-            def progress_cb(msg: str) -> None:
-                self.status_signal.emit(msg)
-            chunk_file_path = self._get_translated_chunked_file_path(self.current_input_file)
-            return self.app_service.translate_single_chunk(
-                self.current_input_file,
-                str(chunk_file_path),
-                chunk_idx,
-                progress_callback=progress_cb,
-            )
-
+        succeeded = 0
+        failed_list: List[int] = []
         try:
-            success, result = await self._loop.run_in_executor(None, task)
-            if success:
-                self._set_status(f"청크 #{chunk_idx} 재번역 완료")
-                QtWidgets.QMessageBox.information(self, "성공", f"청크 #{chunk_idx} 재번역 완료")
-                await self._load_metadata_from_path(self.current_input_file, silent=True)
+            for i, chunk_idx in enumerate(indices, 1):
+                self._set_status(f"재번역 중 ({i}/{n})")
+                logger.info(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 재번역 중...")
+
+                def task(idx=chunk_idx) -> Tuple[bool, str]:
+                    def progress_cb(msg: str) -> None:
+                        self.status_signal.emit(msg)
+                    chunk_file_path = self._get_translated_chunked_file_path(self.current_input_file)
+                    return self.app_service.translate_single_chunk(
+                        self.current_input_file,
+                        str(chunk_file_path),
+                        idx,
+                        progress_callback=progress_cb,
+                    )
+
+                try:
+                    success, result = await self._loop.run_in_executor(None, task)
+                except Exception as e:
+                    logger.error(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 오류: {e}")
+                    self._set_status(f"재번역 오류 ({i}/{n}): {e}")
+                    QtWidgets.QMessageBox.critical(self, "재번역 오류", str(e))
+                    break
+
+                if success:
+                    succeeded += 1
+                    logger.info(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 완료")
+                else:
+                    failed_list.append(chunk_idx)
+                    logger.warning(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 실패: {result}")
+
+            await self._load_metadata_from_path(self.current_input_file, silent=True)
+            if failed_list:
+                fail_str = ", ".join(f"#{x}" for x in failed_list)
+                self._set_status(f"재번역 완료 ({succeeded}/{n} 성공, 실패: {fail_str})")
+                QtWidgets.QMessageBox.warning(self, "재번역 완료", f"{succeeded}/{n}개 성공\n실패 청크: {fail_str}")
             else:
-                self._set_status(f"재번역 실패: {result}")
-                QtWidgets.QMessageBox.critical(self, "재번역 실패", result)
-        except Exception as e:
-            self._set_status(f"재번역 오류: {e}")
-            QtWidgets.QMessageBox.critical(self, "재번역 오류", str(e))
+                self._set_status(f"재번역 완료 ({succeeded}/{n})")
+                QtWidgets.QMessageBox.information(self, "성공", f"{n}개 청크 재번역 완료")
         finally:
             self._set_busy(False)
 

@@ -70,6 +70,13 @@ class ReviewTabQt(QtWidgets.QWidget):
         self._source_cache: Dict[str, Dict[int, str]] = {}
         self._source_cache_info: Dict[str, Tuple[float, int]] = {}
 
+        # retranslate queue state
+        self._retranslate_queue: List[int] = []
+        self._retranslate_pending: set = set()
+        self._retranslate_done: int = 0
+        self._retranslate_total: int = 0
+        self._retranslate_running: bool = False
+
         # ui refs
         self.file_path_edit: Optional[QtWidgets.QLineEdit] = None
         self.table: Optional[QtWidgets.QTableView] = None
@@ -316,12 +323,23 @@ class ReviewTabQt(QtWidgets.QWidget):
             self.status_label.setText(msg)
 
     def _set_busy(self, busy: bool) -> None:
+        # retranslate_btn은 큐 추가 모드 때문에 별도 관리 (_set_retranslate_btn_queue_mode)
         for btn in (
-            self.load_btn, self.refresh_btn, self.retranslate_btn, self.edit_btn,
+            self.load_btn, self.refresh_btn, self.edit_btn,
             self.reset_btn, self.confirm_btn, self.copy_src_btn, self.copy_trans_btn,
             self.final_btn, self.integrity_btn
         ):
             btn.setEnabled(not busy)
+
+    def _set_retranslate_btn_queue_mode(self, queue_mode: bool) -> None:
+        if queue_mode:
+            self.retranslate_btn.setText("큐에 추가")
+            self.retranslate_btn.setStyleSheet(
+                "QPushButton { background-color: #FFC107; color: #000000; }"
+            )
+        else:
+            self.retranslate_btn.setText("재번역")
+            self.retranslate_btn.setStyleSheet("")
 
     def _browse_file(self) -> None:
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "입력 파일 선택", filter="Text Files (*.txt);;All Files (*)")
@@ -609,61 +627,97 @@ class ReviewTabQt(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "경고", "현재 번역 작업이 진행 중입니다. 완료 후 시도하세요.")
             return
 
+        if self._retranslate_running:
+            # 큐에 추가 모드: 중복 제거 후 삽입
+            new_indices = [i for i in indices if i not in self._retranslate_pending]
+            if not new_indices:
+                self._set_status("선택한 청크는 이미 큐에 있습니다.")
+                return
+            self._retranslate_queue.extend(new_indices)
+            self._retranslate_pending.update(new_indices)
+            self._retranslate_total += len(new_indices)
+            self._set_status(
+                f"재번역 중 ({self._retranslate_done}/{self._retranslate_total}) "
+                f"— {len(new_indices)}개 추가됨"
+            )
+            logger.info(f"재번역 큐에 {len(new_indices)}개 추가: {new_indices}")
+            return
+
+        # 새 재번역 시작 — 확인 다이얼로그
         n = len(indices)
         if n == 1:
-            prompt = f"청크 #{indices[0]}를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다."
+            prompt_msg = f"청크 #{indices[0]}를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다."
         else:
             preview = ", ".join(f"#{i}" for i in indices[:5])
             if n > 5:
                 preview += "..."
-            prompt = f"선택한 {n}개 청크({preview})를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다."
-        if QtWidgets.QMessageBox.question(self, "재번역 확인", prompt) != QtWidgets.QMessageBox.Yes:
+            prompt_msg = f"선택한 {n}개 청크({preview})를 재번역하시겠습니까?\n현재 번역 설정이 적용됩니다."
+        if QtWidgets.QMessageBox.question(self, "재번역 확인", prompt_msg) != QtWidgets.QMessageBox.Yes:
             return
 
-        self._set_busy(True)
-        succeeded = 0
-        failed_list: List[int] = []
-        try:
-            for i, chunk_idx in enumerate(indices, 1):
-                self._set_status(f"재번역 중 ({i}/{n})")
-                logger.info(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 재번역 중...")
+        self._retranslate_queue = list(indices)
+        self._retranslate_pending = set(indices)
+        self._retranslate_done = 0
+        self._retranslate_total = n
+        asyncio.create_task(self._run_retranslate_loop())
 
-                def task(idx=chunk_idx) -> Tuple[bool, str]:
-                    def progress_cb(msg: str) -> None:
-                        self.status_signal.emit(msg)
-                    chunk_file_path = self._get_translated_chunked_file_path(self.current_input_file)
-                    return self.app_service.translate_single_chunk(
-                        self.current_input_file,
-                        str(chunk_file_path),
-                        idx,
-                        progress_callback=progress_cb,
-                    )
+    async def _run_retranslate_loop(self) -> None:
+        self._retranslate_running = True
+        self._set_busy(True)
+        self._set_retranslate_btn_queue_mode(True)
+        failed_list: List[int] = []
+
+        try:
+            while self._retranslate_queue:
+                chunk_idx = self._retranslate_queue.pop(0)
+                current_num = self._retranslate_done + 1
+                self._set_status(f"재번역 중 ({current_num}/{self._retranslate_total})")
+                logger.info(f"재번역 ({current_num}/{self._retranslate_total}) 청크 #{chunk_idx}")
+
+                chunk_file_path = self._get_translated_chunked_file_path(self.current_input_file)
+
+                def progress_cb(msg: str, _n=current_num, _t=self._retranslate_total) -> None:
+                    self.status_signal.emit(f"({_n}/{_t}) {msg}")
 
                 try:
-                    success, result = await self._loop.run_in_executor(None, task)
+                    success, result = await self.app_service.translate_single_chunk_async(
+                        self.current_input_file,
+                        str(chunk_file_path),
+                        chunk_idx,
+                        progress_callback=progress_cb,
+                    )
                 except Exception as e:
-                    logger.error(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 오류: {e}")
-                    self._set_status(f"재번역 오류 ({i}/{n}): {e}")
+                    logger.error(f"청크 #{chunk_idx} 재번역 오류: {e}")
+                    self._set_status(f"재번역 오류: {e}")
                     QtWidgets.QMessageBox.critical(self, "재번역 오류", str(e))
                     break
 
+                self._retranslate_done += 1
+                self._retranslate_pending.discard(chunk_idx)
+
                 if success:
-                    succeeded += 1
-                    logger.info(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 완료")
+                    logger.info(f"청크 #{chunk_idx} 완료")
                 else:
                     failed_list.append(chunk_idx)
-                    logger.warning(f"(재번역 {i}/{n}) 청크 #{chunk_idx} 실패: {result}")
-
-            await self._load_metadata_from_path(self.current_input_file, silent=True)
-            if failed_list:
-                fail_str = ", ".join(f"#{x}" for x in failed_list)
-                self._set_status(f"재번역 완료 ({succeeded}/{n} 성공, 실패: {fail_str})")
-                QtWidgets.QMessageBox.warning(self, "재번역 완료", f"{succeeded}/{n}개 성공\n실패 청크: {fail_str}")
-            else:
-                self._set_status(f"재번역 완료 ({succeeded}/{n})")
-                QtWidgets.QMessageBox.information(self, "성공", f"{n}개 청크 재번역 완료")
+                    logger.warning(f"청크 #{chunk_idx} 실패: {result}")
         finally:
+            self._retranslate_running = False
+            self._retranslate_queue.clear()
+            self._retranslate_pending.clear()
             self._set_busy(False)
+            self._set_retranslate_btn_queue_mode(False)
+
+        # 완료 처리 (finally 이후 버튼 복원 상태에서 실행)
+        total = self._retranslate_total
+        succeeded = self._retranslate_done - len(failed_list)
+        await self._load_metadata_from_path(self.current_input_file, silent=True)
+        if failed_list:
+            fail_str = ", ".join(f"#{x}" for x in failed_list)
+            self._set_status(f"재번역 완료 ({succeeded}/{total} 성공, 실패: {fail_str})")
+            QtWidgets.QMessageBox.warning(self, "재번역 완료", f"{succeeded}/{total}개 성공\n실패 청크: {fail_str}")
+        else:
+            self._set_status(f"재번역 완료 ({succeeded}/{total})")
+            QtWidgets.QMessageBox.information(self, "성공", f"{total}개 청크 재번역 완료")
 
     def _on_edit_clicked(self) -> None:
         chunk_idx = self._selected_index_single()

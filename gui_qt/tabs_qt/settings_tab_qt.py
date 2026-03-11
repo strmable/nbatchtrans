@@ -388,13 +388,49 @@ class SettingsTabQt(QtWidgets.QWidget):
         self.enable_prefix_tracking_check = QtWidgets.QCheckBox("프리픽스 기반 번역 누락 감지 사용")
         TooltipQt(
             self.enable_prefix_tracking_check,
-            "각 문장 앞에 [00001] 형식의 번호를 붙여 번역합니다.\n"
+            "각 문장 앞에 [00001]| 형식의 번호를 붙여 번역합니다.\n"
             "번역 누락 문장은 원문으로 대체되며,\n"
             "@offset::줄번호 형태의 주석으로 표시됩니다.\n"
             "수동 번역 보완 작업에 활용할 수 있습니다.\n\n"
             "※ 번역 결과에 프리픽스가 전혀 없으면 즉시 오류로 중단됩니다."
         )
         prefix_vbox.addWidget(self.enable_prefix_tracking_check)
+        self.enable_prefix_missing_retranslate_check = QtWidgets.QCheckBox("누락 줄 자동 재번역 시도")
+        TooltipQt(
+            self.enable_prefix_missing_retranslate_check,
+            "번역 누락 줄이 발생하면 해당 줄만 원본 프리픽스 번호를 유지하여 즉시 재번역합니다.\n"
+            "재번역도 실패하면 원문을 그대로 삽입합니다.\n\n"
+            "OFF 시: 누락 줄에 @offset::줄번호 마커를 제자리에 출력합니다."
+        )
+        prefix_vbox.addWidget(self.enable_prefix_missing_retranslate_check)
+
+        # --- 이전 청크 컨텍스트 주입 ---
+        context_group = QtWidgets.QGroupBox("이전 청크 컨텍스트 주입")
+        context_vbox = QtWidgets.QVBoxLayout(context_group)
+        self.enable_context_injection_check = QtWidgets.QCheckBox("이전 청크 원문을 컨텍스트로 전달")
+        TooltipQt(
+            self.enable_context_injection_check,
+            "번역 시 직전 청크의 원문을 참고용으로 AI에게 전달합니다.\n"
+            "인물명·용어·문체의 연속성 유지에 활용됩니다.\n\n"
+            "프롬프트에 {{context}} 플레이스홀더가 있으면 해당 위치에 삽입되고,\n"
+            "없으면 프롬프트 앞에 아래 형식으로 자동 삽입됩니다:\n"
+            "=====CONTEXT=====\n"
+            "(이전 청크 원문)\n"
+            "==============="
+        )
+        context_vbox.addWidget(self.enable_context_injection_check)
+
+        # --- 상세 번역 로그 ---
+        verbose_group = QtWidgets.QGroupBox("디버그 로그")
+        verbose_vbox = QtWidgets.QVBoxLayout(verbose_group)
+        self.enable_verbose_log_check = QtWidgets.QCheckBox("상세 번역 로그 출력")
+        TooltipQt(
+            self.enable_verbose_log_check,
+            "번역 시 전송 프롬프트 전문, API 원본 응답, 프리픽스 부착 텍스트,\n"
+            "재구성된 번역 결과를 로그에 전체 출력합니다.\n"
+            "로그 파일이 매우 커질 수 있으므로 디버깅 시에만 사용하세요."
+        )
+        verbose_vbox.addWidget(self.enable_verbose_log_check)
 
         # --- 액션/진행 표시 ---
         self.start_btn = QtWidgets.QPushButton("번역 시작")
@@ -426,6 +462,8 @@ class SettingsTabQt(QtWidgets.QWidget):
         layout.addWidget(prefill_group)
         layout.addWidget(safety_group)
         layout.addWidget(prefix_group)
+        layout.addWidget(context_group)
+        layout.addWidget(verbose_group)
         layout.addLayout(btn_row)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
@@ -615,6 +653,15 @@ class SettingsTabQt(QtWidgets.QWidget):
         self.enable_prefix_tracking_check.setChecked(
             bool(cfg.get("enable_prefix_tracking", defaults.get("enable_prefix_tracking", False)))
         )
+        self.enable_prefix_missing_retranslate_check.setChecked(
+            bool(cfg.get("enable_prefix_missing_retranslate", defaults.get("enable_prefix_missing_retranslate", False)))
+        )
+        self.enable_context_injection_check.setChecked(
+            bool(cfg.get("enable_context_injection", defaults.get("enable_context_injection", False)))
+        )
+        self.enable_verbose_log_check.setChecked(
+            bool(cfg.get("enable_verbose_translation_log", defaults.get("enable_verbose_translation_log", False)))
+        )
 
     def _save_config_to_service(self) -> None:
         # 서비스의 설정을 직접 수정하지 않도록 복사본 생성 (Deep Copy 권장)
@@ -652,6 +699,9 @@ class SettingsTabQt(QtWidgets.QWidget):
         cfg["max_content_safety_split_attempts"] = int(self.max_split_spin.value())
         cfg["min_content_safety_chunk_size"] = int(self.min_chunk_spin.value())
         cfg["enable_prefix_tracking"] = self.enable_prefix_tracking_check.isChecked()
+        cfg["enable_prefix_missing_retranslate"] = self.enable_prefix_missing_retranslate_check.isChecked()
+        cfg["enable_context_injection"] = self.enable_context_injection_check.isChecked()
+        cfg["enable_verbose_translation_log"] = self.enable_verbose_log_check.isChecked()
         # self.app_service.config = cfg  # 직접 할당 제거 (save_app_config 내부에서 처리됨)
         try:
             self.app_service.save_app_config(cfg)

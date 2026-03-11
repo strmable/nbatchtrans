@@ -3,6 +3,7 @@ from pathlib import Path
 # typing 모듈에서 Tuple을 임포트합니다.
 from typing import Dict, Any, Optional, List, Callable, Union, Tuple
 import os
+import re
 import json
 import csv
 import logging
@@ -886,7 +887,8 @@ class AppService:
                 metadata_file_path,
                 input_file_path_obj,
                 progress_callback,
-                tqdm_file_stream
+                tqdm_file_stream,
+                all_source_chunks=all_chunks,
             )
             
             logger.info("모든 청크 처리 완료. 결과 병합 및 최종 저장 시작...")
@@ -973,7 +975,8 @@ class AppService:
         metadata_file_path: Path,
         input_file_path: Path,
         progress_callback: Optional[Callable[[TranslationJobProgressDTO], None]] = None,
-        tqdm_file_stream: Optional[Any] = None
+        tqdm_file_stream: Optional[Any] = None,
+        all_source_chunks: Optional[List[str]] = None,
     ) -> None:
         """
         청크들을 비동기로 병렬 처리
@@ -996,6 +999,13 @@ class AppService:
                 line_offsets[cidx] = cumulative
                 cumulative += self.prefix_service.count_chunk_lines(ctext)
             logger.info(f"프리픽스 추적 모드: 총 {cumulative}줄에 대한 오프셋 계산 완료")
+
+        # 컨텍스트 주입 모드: chunk_index → 이전 청크 원문 사전 계산
+        prev_chunk_map: Dict[int, str] = {}
+        if self.config.get("enable_context_injection", False) and all_source_chunks:
+            for cidx, _ in chunks:
+                prev_chunk_map[cidx] = all_source_chunks[cidx - 1] if cidx > 0 else ""
+            logger.info(f"컨텍스트 주입 모드: {len(chunks)}개 청크의 이전 청크 원문 매핑 완료")
 
         max_workers = self.config.get("max_workers", 4)
         rpm = self.config.get("requests_per_minute", 60)
@@ -1070,7 +1080,8 @@ class AppService:
                     metadata_file_path,
                     input_file_path,
                     progress_callback,
-                    global_line_offset=line_offsets.get(chunk_index, 0)
+                    global_line_offset=line_offsets.get(chunk_index, 0),
+                    prev_chunk_text=prev_chunk_map.get(chunk_index, ""),
                 )
         
         # Task 리스트 생성
@@ -1128,7 +1139,8 @@ class AppService:
         metadata_file_path: Path,
         input_file_path: Path,
         progress_callback: Optional[Callable[[TranslationJobProgressDTO], None]] = None,
-        global_line_offset: int = 0
+        global_line_offset: int = 0,
+        prev_chunk_text: str = "",
     ) -> bool:
         """
         비동기 청크 처리 (동기 버전과 동일한 로깅 구조)
@@ -1158,7 +1170,30 @@ class AppService:
         last_error = ""
         success = False
         translated_chunk = ""
-        
+
+        # 청크별 품질 통계 (패턴 분석용)
+        chunk_stats: Dict[str, Any] = {
+            "chunk": chunk_index + 1,
+            "total": total_chunks,
+            "src_chars": chunk_chars,
+            "src_lines": 0,          # 전체 줄 수
+            "prefix_total": 0,        # 비어있지 않은 줄 (프리픽스 부착 수)
+            "matched_1st": 0,         # 1차 번역에서 매칭된 수
+            "missing_1st": 0,         # 1차 번역에서 누락된 수
+            "missing_rate": 0.0,      # 누락율 (%)
+            "overflow": 0,            # 원본에 없는 번호 (hallucinated prefix 의심)
+            "duplicate": 0,           # 중복 프리픽스 수
+            "retrans": False,         # 재번역 실행 여부
+            "retrans_filled": 0,      # 재번역으로 채워진 수
+            "final_missing": 0,       # 최종 누락 수
+            "trans_chars": 0,         # 번역 결과 길이
+            "ratio": 0.0,             # 길이 비율 (번역/원본)
+            "api_sec": 0.0,           # API 소요 시간
+            "total_sec": 0.0,         # 전체 소요 시간
+            "success": False,
+            "anomalies": [],          # 이상 징후 플래그
+        }
+
         try:
             # 빈 청크 체크
             if not chunk_text.strip():
@@ -1174,6 +1209,15 @@ class AppService:
             
             translation_start_time = time.time()
 
+            # 컨텍스트 주입 모드: 이전 청크 원문을 파라미터로 직접 전달 (병렬 처리 경쟁 조건 방지)
+            context_text = ""
+            if self.config.get("enable_context_injection", False):
+                context_text = prev_chunk_text
+                if prev_chunk_text:
+                    logger.info(f"  [컨텍스트] 청크 #{chunk_index}: 이전 청크 원문 {len(prev_chunk_text)}자 전달")
+                else:
+                    logger.info(f"  [컨텍스트] 청크 #{chunk_index}: 첫 청크 — 이전 컨텍스트 없음")
+
             # 프리픽스 추적 모드: 번역 전 프리픽스 추가
             enable_prefix = self.config.get("enable_prefix_tracking", False)
             line_metadata = None
@@ -1181,30 +1225,130 @@ class AppService:
                 prefixed_text, line_metadata = self.prefix_service.add_prefixes_to_chunk(
                     chunk_text, global_line_offset
                 )
+                # 통계: 줄 수 및 프리픽스 총수 기록
+                chunk_stats["src_lines"] = len(line_metadata)
+                chunk_stats["prefix_total"] = sum(1 for m in line_metadata if not m.is_empty)
                 text_to_translate = prefixed_text
                 logger.debug(f"  [프리픽스] {chunk_index + 1}번 청크에 번호 부착 완료 (offset={global_line_offset})")
+                if self.config.get("enable_verbose_translation_log", False):
+                    logger.info(
+                        f"[상세로그] ===== 프리픽스 부착 텍스트 ({len(prefixed_text)}자) =====\n"
+                        f"{prefixed_text}\n"
+                        f"[상세로그] ===== 프리픽스 텍스트 끝 ====="
+                    )
             else:
                 text_to_translate = chunk_text
 
             # 비동기 번역 호출 (timeout은 GeminiClient의 http_options에 의해 자동 적용)
             try:
                 raw_translated = await self.translation_service.translate_chunk_async(
-                    text_to_translate
+                    text_to_translate,
+                    context_text=context_text
                 )
 
                 # 프리픽스 추적 모드: 번역 결과 파싱 및 재구성
                 if enable_prefix and line_metadata is not None:
                     translated_map = self.prefix_service.parse_prefixed_translation(raw_translated)
-                    translated_chunk = self.prefix_service.reconstruct_output(line_metadata, translated_map)
+
+                    # 통계: 1차 매칭 결과 수집
+                    prefix_total = chunk_stats["prefix_total"]
+                    matched_1st = len(translated_map)
+                    missing_1st_count = max(0, prefix_total - matched_1st)
+                    # overflow: 원본에 없는 번호가 응답에 포함됨 (hallucinated prefix)
+                    overflow_count = sum(1 for k in translated_map if k > prefix_total or k < 1)
+                    # 중복 프리픽스: 응답에서 같은 번호가 여러 번 등장한 횟수
+                    all_nums_in_response = re.findall(r'^\[(\d{5})\]', raw_translated, re.MULTILINE)
+                    duplicate_count = len(all_nums_in_response) - len(set(all_nums_in_response))
+                    missing_rate = (missing_1st_count / prefix_total * 100) if prefix_total > 0 else 0.0
+
+                    chunk_stats["matched_1st"] = matched_1st
+                    chunk_stats["missing_1st"] = missing_1st_count
+                    chunk_stats["missing_rate"] = round(missing_rate, 1)
+                    chunk_stats["overflow"] = overflow_count
+                    chunk_stats["duplicate"] = duplicate_count
+
+                    enable_missing_retranslate = self.config.get("enable_prefix_missing_retranslate", False)
+                    if enable_missing_retranslate:
+                        # 누락 줄 수집 후 원본 프리픽스 번호로 재번역 시도
+                        missing = [
+                            (meta.prefix_num, meta.original_text)
+                            for meta in line_metadata
+                            if not meta.is_empty and meta.prefix_num not in translated_map
+                        ]
+                        if missing:
+                            chunk_stats["retrans"] = True
+                            map_before = set(translated_map.keys())
+                            translated_map = await self._retranslate_missing_with_original_prefixes(
+                                missing, translated_map
+                            )
+                            chunk_stats["retrans_filled"] = len(translated_map) - len(map_before)
+                        # 최종 누락 수
+                        chunk_stats["final_missing"] = sum(
+                            1 for meta in line_metadata
+                            if not meta.is_empty and meta.prefix_num not in translated_map
+                        )
+                        # 재번역 후에도 남은 누락 줄은 원문으로 대체
+                        translated_chunk = self.prefix_service.reconstruct_output(
+                            line_metadata, translated_map, original_text_on_missing=True
+                        )
+                    else:
+                        chunk_stats["final_missing"] = missing_1st_count
+                        # 기본: 누락 줄을 @offset:: 마커로 제자리 출력
+                        translated_chunk = self.prefix_service.reconstruct_output(line_metadata, translated_map)
+
                     logger.debug(f"  [프리픽스] {chunk_index + 1}번 청크 재구성 완료 ({len(translated_map)}개 매칭)")
+                    if self.config.get("enable_verbose_translation_log", False):
+                        logger.info(
+                            f"[상세로그] ===== 재구성된 번역 결과 ({len(translated_chunk)}자) =====\n"
+                            f"{translated_chunk}\n"
+                            f"[상세로그] ===== 재구성 결과 끝 ====="
+                        )
                 else:
                     translated_chunk = raw_translated
 
                 success = True
-                
+
                 translation_time = time.time() - translation_start_time
                 translated_length = len(translated_chunk)
-                
+
+                # 통계 완성 및 이상 징후 탐지
+                ratio = translated_length / chunk_chars if chunk_chars > 0 else 0.0
+                chunk_stats["trans_chars"] = translated_length
+                chunk_stats["ratio"] = round(ratio, 2)
+                chunk_stats["api_sec"] = round(translation_time, 1)
+                chunk_stats["success"] = True
+
+                anomalies = chunk_stats["anomalies"]
+                if enable_prefix:
+                    mr = chunk_stats["missing_rate"]
+                    if mr >= 50.0:
+                        anomalies.append(f"HIGH_MISSING({mr:.0f}%)")
+                    elif mr > 0.0:
+                        anomalies.append(f"SOME_MISSING({mr:.0f}%)")
+                    if chunk_stats["overflow"] > 0:
+                        anomalies.append(f"HALLUCINATED_PREFIX({chunk_stats['overflow']})")
+                    if chunk_stats["duplicate"] > 0:
+                        anomalies.append(f"DUPLICATE_PREFIX({chunk_stats['duplicate']})")
+                    if chunk_stats["final_missing"] > 0:
+                        anomalies.append(f"UNRECOVERED_MISSING({chunk_stats['final_missing']})")
+                if ratio < 0.5:
+                    anomalies.append(f"LOW_RATIO({ratio:.2f})")
+                elif ratio > 3.0:
+                    anomalies.append(f"HIGH_RATIO({ratio:.2f})")
+
+                anomaly_str = ",".join(anomalies) if anomalies else "none"
+                logger.info(
+                    f"[CHUNK_STATS] chunk={chunk_stats['chunk']}/{chunk_stats['total']} "
+                    f"src={chunk_chars}ch trans={translated_length}ch ratio={ratio:.2f} | "
+                    f"prefix_total={chunk_stats['prefix_total']} "
+                    f"matched_1st={chunk_stats['matched_1st']} "
+                    f"missing_1st={chunk_stats['missing_1st']}({chunk_stats['missing_rate']}%) "
+                    f"overflow={chunk_stats['overflow']} dup={chunk_stats['duplicate']} | "
+                    f"retrans={chunk_stats['retrans']} filled={chunk_stats['retrans_filled']} "
+                    f"final_missing={chunk_stats['final_missing']} | "
+                    f"api={chunk_stats['api_sec']}s | anomalies=[{anomaly_str}]"
+                )
+
                 # 번역 성능 상세는 DEBUG에서만
                 if logger.isEnabledFor(logging.DEBUG):
                     speed = chunk_chars / translation_time if translation_time > 0 else 0
@@ -1274,6 +1418,7 @@ class AppService:
         
         finally:
             total_time = time.time() - start_time
+            chunk_stats["total_sec"] = round(total_time, 1)
             # 상태 업데이트 (Lock 불필요, asyncio 단일 스레드)
             self.processed_chunks_count += 1
             if success:
@@ -1350,6 +1495,45 @@ class AppService:
 
 
 
+
+    async def _retranslate_missing_with_original_prefixes(
+        self,
+        missing: list[tuple[int, str]],
+        translated_map: dict[int, str],
+    ) -> dict[int, str]:
+        """누락된 줄을 원본 프리픽스 번호 그대로 유지하여 재번역하고 translated_map을 보완.
+
+        Args:
+            missing: [(prefix_num, original_text), ...] 누락된 줄 목록
+            translated_map: 기존 번역 결과
+
+        Returns:
+            재번역 결과가 병합된 새 translated_map
+        """
+        if not missing:
+            return translated_map
+
+        logger.info(f"[프리픽스] 누락 {len(missing)}줄 재번역 시작 (원본 프리픽스 번호 유지)")
+
+        # 원본 프리픽스 번호를 그대로 사용한 미니 청크 구성
+        mini_chunk = '\n'.join(
+            f'[{pnum:05d}]|{orig}' for pnum, orig in missing
+        )
+
+        updated_map = dict(translated_map)
+        try:
+            raw_mini = await self.translation_service.translate_chunk_async(mini_chunk)
+            mini_map = self.prefix_service.parse_prefixed_translation(raw_mini)
+            filled = 0
+            for pnum, translated in mini_map.items():
+                if pnum not in updated_map:
+                    updated_map[pnum] = translated
+                    filled += 1
+            logger.info(f"[프리픽스] 누락 재번역 완료: {filled}/{len(missing)}줄 매칭 성공")
+        except Exception as e:
+            logger.warning(f"[프리픽스] 누락 재번역 실패 — 원문으로 대체: {e}")
+
+        return updated_map
 
     def request_stop_translation(self):
         """
@@ -1584,21 +1768,51 @@ class AppService:
             except Exception as e_glossary:
                 logger.warning(f"용어집 로딩 중 오류 (무시하고 계속): {e_glossary}")
 
+            # 프리픽스 추적 모드: 번역 전 프리픽스 부착
+            enable_prefix = self.config.get("enable_prefix_tracking", False)
+            line_metadata = None
+            if enable_prefix:
+                # global_line_offset: chunk_index 이전 청크들의 줄 수 합산
+                global_line_offset = 0
+                for prev_idx in range(chunk_index):
+                    global_line_offset += self.prefix_service.count_chunk_lines(all_chunks[prev_idx])
+                input_text, line_metadata = self.prefix_service.add_prefixes_to_chunk(
+                    chunk_text, global_line_offset
+                )
+                logger.debug(f"청크 #{chunk_index} 프리픽스 부착: {len(line_metadata)}줄, offset={global_line_offset}")
+            else:
+                input_text = chunk_text
+
             start_time = time.time()
 
             if use_content_safety_retry:
-                translated_text = await self.translation_service.translate_text_with_content_safety_retry_async(
-                    chunk_text, max_split_attempts, min_chunk_size
+                raw_translated = await self.translation_service.translate_text_with_content_safety_retry_async(
+                    input_text, max_split_attempts, min_chunk_size
                 )
             else:
-                translated_text = await self.translation_service.translate_text_async(chunk_text)
+                raw_translated = await self.translation_service.translate_text_async(input_text)
 
             translation_time = time.time() - start_time
 
-            if not translated_text:
+            if not raw_translated:
                 error_msg = "번역 결과가 비어있습니다."
                 logger.error(f"청크 #{chunk_index} 재번역 실패: {error_msg}")
                 return False, error_msg
+
+            # 프리픽스 추적 모드: 번역 결과 파싱 및 재구성
+            if enable_prefix and line_metadata is not None:
+                translated_map = self.prefix_service.parse_prefixed_translation(raw_translated)
+                translated_text = self.prefix_service.reconstruct_output(
+                    line_metadata, translated_map, original_text_on_missing=True
+                )
+                missing = sum(
+                    1 for meta in line_metadata
+                    if not meta.is_empty and meta.prefix_num not in translated_map
+                )
+                if missing:
+                    logger.warning(f"청크 #{chunk_index} 재번역: {missing}줄 누락 (원문으로 대체)")
+            else:
+                translated_text = raw_translated
 
             translated_chunked_path = chunk_file_path_obj
             translated_chunks = {}

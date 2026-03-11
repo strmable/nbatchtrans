@@ -30,9 +30,41 @@ class QtGuiLogHandler(logging.Handler):
         try:
             msg = self.format(record)
             is_chunk_complete = "🎯" in msg and "전체 처리 완료" in msg
-            if "⚠️" not in msg and not is_chunk_complete and record.levelno < logging.ERROR:
+            is_chunk_stats = "[CHUNK_STATS]" in msg
+            if "⚠️" not in msg and not is_chunk_complete and not is_chunk_stats and record.levelno < logging.ERROR:
                 return
-            level_name = record.levelname
+            if is_chunk_stats:
+                import re as _re
+                fm = _re.search(r'final_missing=(\d+)', msg)
+                rm = _re.search(r'ratio=([\d.]+)', msg)
+                ratio = float(rm.group(1)) if rm else 99.0
+                # 4단계: 적 — 실패/복구불가/완전오류
+                is_error = (
+                    (fm and int(fm.group(1)) > 0)
+                    or "DUPLICATE_PREFIX" in msg
+                    or ratio < 1.1
+                )
+                # 3단계: 주황 — 대량 소실 또는 비정상 사이즈
+                is_critical = (
+                    "HIGH_MISSING" in msg
+                    or "HIGH_RATIO" in msg
+                    or ratio > 3.0
+                )
+                # 2단계: 황 — 소량 missing (재번역으로 복구됨)
+                is_warn = (
+                    "retrans=True" in msg
+                    or ("anomalies=" in msg and "anomalies=[none]" not in msg)
+                )
+                if is_error:
+                    level_name = "CHUNK_STATS_ERROR"
+                elif is_critical:
+                    level_name = "CHUNK_STATS_CRITICAL"
+                elif is_warn:
+                    level_name = "CHUNK_STATS_WARN"
+                else:
+                    level_name = "CHUNK_STATS"
+            else:
+                level_name = record.levelname
             self.emitter.message.emit(msg, level_name)
         except Exception:
             self.handleError(record)
@@ -121,22 +153,30 @@ class LogTabQt(QtWidgets.QWidget):
         if is_dark:
             # 다크 테마: 밝은 색상 사용
             self._color_palette = {
-                "DEBUG": "#808080",      # 중간 회색
-                "INFO": "#e0e0e0",       # 밝은 회색 (기존 black 대체)
-                "WARNING": "#FFB347",    # 밝은 주황색
-                "ERROR": "#ff6b6b",      # 밝은 빨강
-                "CRITICAL": "#ff3333",   # 더 밝은 빨강
-                "TQDM": "#90ee90",       # 밝은 녹색
+                "DEBUG": "#808080",           # 중간 회색
+                "INFO": "#e0e0e0",            # 밝은 회색 (기존 black 대체)
+                "WARNING": "#FFB347",         # 밝은 주황색
+                "ERROR": "#ff6b6b",           # 밝은 빨강
+                "CRITICAL": "#ff3333",        # 더 밝은 빨강
+                "TQDM": "#90ee90",            # 밝은 녹색
+                "CHUNK_STATS": "#4dd0e1",          # 1단계: 청록 (정상)
+                "CHUNK_STATS_WARN": "#FFD700",     # 2단계: 황 (소량 missing, 복구됨)
+                "CHUNK_STATS_CRITICAL": "#FF8C00", # 3단계: 주황 (대량 소실/사이즈 이상)
+                "CHUNK_STATS_ERROR": "#ff6b6b",    # 4단계: 적 (실패/복구불가/오류)
             }
         else:
             # 라이트 테마: 어두운 색상 사용
             self._color_palette = {
-                "DEBUG": "#666666",      # 어두운 회색
-                "INFO": "#000000",       # 검정
-                "WARNING": "#FF8C00",    # 다크 오렌지
-                "ERROR": "#cc0000",      # 어두운 빨강
-                "CRITICAL": "#8b0000",   # 더 어두운 빨강
-                "TQDM": "#006400",       # 어두운 녹색
+                "DEBUG": "#666666",           # 어두운 회색
+                "INFO": "#000000",            # 검정
+                "WARNING": "#FF8C00",         # 다크 오렌지
+                "ERROR": "#cc0000",           # 어두운 빨강
+                "CRITICAL": "#8b0000",        # 더 어두운 빨강
+                "TQDM": "#006400",            # 어두운 녹색
+                "CHUNK_STATS": "#007b8a",          # 1단계: 청록 (정상)
+                "CHUNK_STATS_WARN": "#B8860B",     # 2단계: 황 (소량 missing, 복구됨)
+                "CHUNK_STATS_CRITICAL": "#FF6600", # 3단계: 주황 (대량 소실/사이즈 이상)
+                "CHUNK_STATS_ERROR": "#cc0000",    # 4단계: 적 (실패/복구불가/오류)
             }
 
     def _setup_logging(self) -> None:

@@ -666,18 +666,20 @@ class ReviewTabQt(QtWidgets.QWidget):
         self._set_busy(True)
         self._set_retranslate_btn_queue_mode(True)
         failed_list: List[int] = []
+        MAX_PARALLEL = 3
+        semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
-        try:
-            while self._retranslate_queue:
-                chunk_idx = self._retranslate_queue.pop(0)
-                current_num = self._retranslate_done + 1
-                self._set_status(f"재번역 중 ({current_num}/{self._retranslate_total})")
-                logger.info(f"재번역 ({current_num}/{self._retranslate_total}) 청크 #{chunk_idx}")
+        async def _translate_one(chunk_idx: int) -> None:
+            async with semaphore:
+                self._set_status(
+                    f"재번역 중 ({self._retranslate_done}/{self._retranslate_total}) — 청크 #{chunk_idx} 처리 중"
+                )
+                logger.info(f"재번역 시작 청크 #{chunk_idx} ({self._retranslate_done}/{self._retranslate_total})")
 
                 chunk_file_path = self._get_translated_chunked_file_path(self.current_input_file)
 
-                def progress_cb(msg: str, _n=current_num, _t=self._retranslate_total) -> None:
-                    self.status_signal.emit(f"({_n}/{_t}) {msg}")
+                def progress_cb(msg: str, _idx=chunk_idx) -> None:
+                    self.status_signal.emit(f"청크#{_idx}: {msg}")
 
                 try:
                     success, result = await self.app_service.translate_single_chunk_async(
@@ -688,18 +690,28 @@ class ReviewTabQt(QtWidgets.QWidget):
                     )
                 except Exception as e:
                     logger.error(f"청크 #{chunk_idx} 재번역 오류: {e}")
-                    self._set_status(f"재번역 오류: {e}")
-                    QtWidgets.QMessageBox.critical(self, "재번역 오류", str(e))
-                    break
+                    success = False
+                    result = str(e)
 
                 self._retranslate_done += 1
                 self._retranslate_pending.discard(chunk_idx)
 
                 if success:
-                    logger.info(f"청크 #{chunk_idx} 완료")
+                    logger.info(f"청크 #{chunk_idx} 완료 ({self._retranslate_done}/{self._retranslate_total})")
                 else:
                     failed_list.append(chunk_idx)
                     logger.warning(f"청크 #{chunk_idx} 실패: {result}")
+
+                self._set_status(
+                    f"재번역 중 ({self._retranslate_done}/{self._retranslate_total})"
+                )
+
+        try:
+            # 큐에 항목이 있는 동안 반복 (배치 실행 후 새로 추가된 항목도 처리)
+            while self._retranslate_queue:
+                batch = list(self._retranslate_queue)
+                self._retranslate_queue.clear()
+                await asyncio.gather(*[_translate_one(idx) for idx in batch], return_exceptions=True)
         finally:
             self._retranslate_running = False
             self._retranslate_queue.clear()

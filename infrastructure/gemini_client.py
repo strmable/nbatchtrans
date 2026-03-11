@@ -101,7 +101,6 @@ class ContentFilterException(GeminiContentSafetyException):
 class GeminiClient:
     _RATE_LIMIT_PATTERNS = [
         "rateLimitExceeded", "429", "Too Many Requests", "QUOTA_EXCEEDED",
-        "The model is overloaded", "503", "Service Unavailable", 
         "Resource has been exhausted", "RESOURCE_EXHAUSTED"
     ]
 
@@ -370,18 +369,22 @@ class GeminiClient:
 
 
     async def _apply_rpm_delay(self):
-        """요청 속도 제어를 위한 지연 적용 (동시성 개선) - Async"""
-        if self.delay_between_requests <= 0:
-            return
+        """요청 속도 제어를 위한 지연 적용 (동시성 개선) - Async
+
+        병렬 API 요청 간 최소 1초 간격을 보장합니다.
+        503 에러 방지를 위해 RPM 설정과 관계없이 최소 1초를 강제 적용합니다.
+        """
+        # 최소 1초 간격 보장 (RPM 설정값이 더 크면 RPM 우선)
+        effective_delay = max(self.delay_between_requests, 1.0)
 
         sleep_time = 0
         async with self._rpm_lock:
             current_time = time.time()
-            
+
             # 다음 요청이 가능한 가장 빠른 시간을 계산합니다.
             # (이전 요청 예약 시간 + 딜레이)와 현재 시간 중 더 나중의 시간을 선택하여,
             # 여러 스레드가 동시에 요청할 때 순차적으로 실행되도록 예약합니다.
-            next_slot = max(self.last_request_timestamp + self.delay_between_requests, current_time)
+            next_slot = max(self.last_request_timestamp + effective_delay, current_time)
             
             sleep_time = next_slot - current_time
             
@@ -398,17 +401,25 @@ class GeminiClient:
             logger.log(log_level, f"RPM({self.requests_per_minute}) 제어: 다음 요청까지 {sleep_time:.3f}초 대기합니다. (예약된 시작: {scheduled_start_time_str})")
             await asyncio.sleep(sleep_time)
 
+    def _is_service_unavailable_error(self, error_obj: Any) -> bool:
+        """503 / UNAVAILABLE 에러 여부 확인 (rate limit과 별도 처리)"""
+        from google.api_core import exceptions as gapi_exceptions
+        if isinstance(error_obj, gapi_exceptions.ServiceUnavailable):
+            return True
+        msg = str(error_obj)
+        return bool(re.search(r"502|503|UNAVAILABLE|Bad Gateway|experiencing high demand|Service Unavailable", msg, re.IGNORECASE))
+
     def _is_rate_limit_error(self, error_obj: Any) -> bool:
         from google.api_core import exceptions as gapi_exceptions
-    
+
         if isinstance(error_obj, (
             gapi_exceptions.ResourceExhausted,
             gapi_exceptions.DeadlineExceeded,
             gapi_exceptions.TooManyRequests
         )):
             return True
-            
-        return any(re.search(pattern, str(error_obj), re.IGNORECASE) 
+
+        return any(re.search(pattern, str(error_obj), re.IGNORECASE)
                 for pattern in self._RATE_LIMIT_PATTERNS)
 
 
@@ -810,19 +821,29 @@ class GeminiClient:
                 except Exception as e:
                     error_message = str(e)
                     logger.warning(f"API 관련 오류 발생: {type(e).__name__} - {error_message}")
-                    
+
                     if self._is_invalid_request_error(e):
                         if self.auth_mode == "API_KEY":
                             break
                         else:
                             raise GeminiInvalidRequestException(f"복구 불가능한 요청 오류: {error_message}") from e
+                    elif self._is_service_unavailable_error(e):
+                        # 503: 서버 과부하 — 30초 고정 대기 후 재시도
+                        if current_retry_for_this_key < max_retries:
+                            service_unavailable_wait = 30.0
+                            logger.warning(f"[503] 서버 과부하 감지. {service_unavailable_wait:.1f}초 대기 후 재시도 ({current_retry_for_this_key + 1}/{max_retries})")
+                            await asyncio.sleep(service_unavailable_wait)
+                            current_retry_for_this_key += 1
+                            continue
+                        else:
+                            break
                     elif self._is_rate_limit_error(e):
                         if self._is_quota_exhausted_error(e):
                             if self.current_api_key:
                                 self.key_quota_failure_times[self.current_api_key] = time.time()
                             break
                         if current_retry_for_this_key < max_retries:
-                            await asyncio.sleep(current_backoff + random.uniform(0,1))
+                            await asyncio.sleep(current_backoff + random.uniform(0, 1))
                             current_retry_for_this_key += 1
                             current_backoff = min(current_backoff * 2, max_backoff)
                             continue
@@ -830,7 +851,7 @@ class GeminiClient:
                             break
                     elif "timeout" in error_message.lower() or "timed out" in error_message.lower():
                         if current_retry_for_this_key < max_retries:
-                            await asyncio.sleep(current_backoff + random.uniform(0,1))
+                            await asyncio.sleep(current_backoff + random.uniform(0, 1))
                             current_retry_for_this_key += 1
                             current_backoff = min(current_backoff * 2, max_backoff)
                             continue
@@ -838,7 +859,7 @@ class GeminiClient:
                             break
                     else:
                         if current_retry_for_this_key < max_retries:
-                            await asyncio.sleep(current_backoff + random.uniform(0,1))
+                            await asyncio.sleep(current_backoff + random.uniform(0, 1))
                             current_retry_for_this_key += 1
                             current_backoff = min(current_backoff * 2, max_backoff)
                             continue

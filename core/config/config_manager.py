@@ -104,15 +104,38 @@ class ConfigManager:
             "thinking_level": "high",  # [추가] Thinking Level 기본값 (low, medium, high, minimal)
             "top_p": 0.9, # type: ignore
             "prompts": ( # type: ignore
-                "# 용어집 컨텍스트 (제공된 경우 아래 용어집에 명시된 번역어를 반드시 준수하세요.)\n"
-                "- 용어집에 있는 용어는 반드시 해당 번역어로 번역해야 하며, 변경하거나 다른 표현을 사용하지 마세요.\n"
-                "- 문맥에 따라 자연스럽게 번역하되, 용어집 우선 적용을 최우선으로 합니다.\n"
-                "- 원문의 의미, 뉘앙스, 톤을 유지하면서 자연스럽고 유창한 한국어로 번역해주세요.\n"
-                "- 번역 결과에 용어집 외의 임의 번역어가 포함되지 않도록 주의하세요."
-                "\n\n{{glossary_context}}\n\n"
-                "## 번역할 원문\n\n"
-                "<main id=\"content\">{{slot}}</main>\n\n"
-                "## 번역 결과 (한국어):\n"
+                "ROLE\n\n"
+                "You are a professional translator who translates Chinese web novels into Korean.\n\n\n"
+                "TRANSLATION STYLE\n\n"
+                "Translate the text into natural Korean suitable for a novel.\n\n"
+                "Narration should be written in natural written Korean.\n\n"
+                "Dialogue inside quotation marks (\"\u00a0\") should be translated into natural spoken Korean.\n\n\n"
+                "TRANSLATION RULES\n\n"
+                "Follow these rules strictly.\n\n"
+                "- Translate every sentence faithfully.\n"
+                "- Each sentence must correspond to exactly one translated sentence.\n"
+                "- Do not omit sentences.\n"
+                "- Do not merge sentences.\n"
+                "- Do not summarize the text.\n\n"
+                "- Preserve the meaning, nuance, tone, and atmosphere of the original text.\n\n"
+                "- Structural markers such as chapter titles must not cause deletion of surrounding content.\n"
+                "  Examples: \u672c\u7ae0\u5b8c, \u7b2c111\u7ae0, \uc81c111\uc7a5.\n\n"
+                "- Character names and proper nouns must remain consistent.\n\n\n"
+                "GLOSSARY RULES\n\n"
+                "If glossary entries are provided, they must be followed.\n\n"
+                "- Always use the glossary translation.\n"
+                "- Do not modify glossary translations.\n"
+                "- Do not invent alternative translations.\n"
+                "- Use the glossary translation consistently.\n\n\n"
+                "{{glossary_context}}\n\n\n"
+                "TEXT TO TRANSLATE\n\n"
+                "Translate the following Chinese text into Korean.\n\n"
+                "<main id=\"content\">\n"
+                "{{slot}}\n"
+                "</main>\n\n\n"
+                "OUTPUT\n\n"
+                "Return only the Korean translation.\n"
+                "Do not output explanations.\n"
             ),
             # 콘텐츠 안전 재시도 설정
             "use_content_safety_retry": True,
@@ -177,6 +200,13 @@ class ConfigManager:
 
             # 프리픽스 기반 번역 완전성 검증
             "enable_prefix_tracking": False,
+            "enable_prefix_missing_retranslate": False,  # 누락 줄 자동 재번역 (실패 시 원문 삽입)
+
+            # 이전 청크 컨텍스트 주입
+            "enable_context_injection": False,
+
+            # 상세 번역 로그 (디버그용)
+            "enable_verbose_translation_log": False,
 
             # API 설정
             "api_timeout": 1000.0, # API 호출 타임아웃 (초)

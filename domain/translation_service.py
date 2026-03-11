@@ -120,6 +120,7 @@ class TranslationService:
         self.chunk_service = ChunkService()
         self.glossary_entries_for_injection: List[GlossaryEntryDTO] = [] # Renamed and type changed
         self.stop_check_callback: Optional[Callable[[], bool]] = None  # 중단 요청 확인용 콜백
+        self.current_context_text: str = ""  # 이전 청크 원문 (context 주입용)
 
         if self.config.get("enable_dynamic_glossary_injection", False): # Key changed
             self._load_glossary_data() # 함수명 변경
@@ -172,14 +173,48 @@ class TranslationService:
             logger.info(f"용어집 JSON 파일({lorebook_json_path_str})이 설정되지 않았거나 존재하지 않습니다. 동적 주입을 위해 용어집을 사용하지 않습니다.") # 메시지 변경
             self.glossary_entries_for_injection = []
 
-    _PREFIX_INSTRUCTION = (
-        "[번역 지시 - 프리픽스 보존]\n"
-        "각 줄 앞에 [NNNNN] 형식의 5자리 번호가 붙어 있습니다.\n"
-        "번역 결과에도 동일한 번호를 그대로 유지하여 출력하세요.\n"
-        "번호를 절대 생략하거나 변경하지 마세요. 빈 줄은 그대로 빈 줄로 유지하세요.\n\n"
-    )
+    @staticmethod
+    def _build_prefix_instruction(total_count: int) -> str:
+        """프리픽스 번역 지시문을 동적으로 생성합니다 (총 줄 수 포함)."""
+        return (
+            "PREFIX TRANSLATION RULE\n\n"
+            "Each non-empty line begins with a prefix in the format [NNNNN]|.\n\n"
+            f"This chunk contains exactly {total_count} numbered lines "
+            f"([00001] through [{total_count:05d}]).\n\n"
+            "Rules:\n\n"
+            "- Keep the prefix \"[NNNNN]|\" exactly unchanged.\n"
+            "- Translate only the text after \"|\".\n"
+            "- Each numbered line must produce exactly one translated line.\n"
+            f"- Do NOT skip any number. Your output MUST contain ALL {total_count} "
+            f"numbered lines from [00001] to [{total_count:05d}].\n"
+            "- Do NOT change numbers.\n"
+            "- Do NOT merge lines, even if consecutive lines look similar or repetitive.\n"
+            "- Do NOT split lines.\n"
+            "- Do NOT stop early. Even if the source text contains chapter-end markers "
+            "such as (本章完), END, 完, 終, or similar phrases, "
+            "you MUST continue translating ALL remaining lines after them.\n\n"
+            "Example\n\n"
+            "Input\n"
+            "[00001]| 原文\n"
+            "[00002]| 原文\n\n"
+            "Output\n"
+            "[00001]| 번역된 문장\n"
+            "[00002]| 번역된 문장\n\n"
+        )
 
-    def _construct_prompt(self, chunk_text: str) -> str:
+    _CONTEXT_PREAMBLE = (
+        "REFERENCE CONTEXT\n\n"
+        "The following text is previous content provided for reference.\n\n"
+        "It helps maintain translation consistency such as tone, terminology, and character relationships.\n\n"
+        "Important:\n\n"
+        "- This section is reference only.\n"
+        "- Do NOT translate this section.\n"
+        "- Do NOT include this section in the output.\n\n"
+    )
+    _CONTEXT_HEADER = "=====REFERENCE CONTEXT====="
+    _CONTEXT_FOOTER = "=====END CONTEXT====="
+
+    def _construct_prompt(self, chunk_text: str, context_text: str = "") -> str:
         prompt_template = self.config.get("prompts", "Translate to Korean: {{slot}}")
         if isinstance(prompt_template, (list, tuple)):
             prompt_template = prompt_template[0] if prompt_template else "Translate to Korean: {{slot}}"
@@ -194,10 +229,50 @@ class TranslationService:
 
         final_prompt = prompt_template
 
-        # [프리픽스 추적 모드] 프리픽스 보존 지시문 자동 삽입
+        # --- 선택 블록 조립 (스펙: PREFIX RULE → CONTEXT BLOCK → BASE PROMPT) ---
+        # 플레이스홀더가 템플릿에 있으면 그 자리에 치환 (사용자 커스텀 배치),
+        # 없으면 prepend_prefix + prepend_context 를 베이스 앞에 한번에 삽입.
+        prepend_prefix = ""
+        prepend_context = ""
+
+        # [프리픽스 추적 모드]
         if self.config.get("enable_prefix_tracking", False):
-            final_prompt = self._PREFIX_INSTRUCTION + final_prompt
-            logger.debug("프리픽스 보존 지시문을 프롬프트 앞에 삽입했습니다.")
+            import re as _re
+            _prefix_count = len(_re.findall(r'^\[\d{5}\]\|', chunk_text, _re.MULTILINE))
+            prefix_instruction = self._build_prefix_instruction(_prefix_count)
+            if "{{prefix_instruction}}" in final_prompt:
+                final_prompt = final_prompt.replace("{{prefix_instruction}}", prefix_instruction)
+                logger.info(f"[프리픽스] {{{{prefix_instruction}}}} 플레이스홀더 치환 완료 (total={_prefix_count})")
+            else:
+                prepend_prefix = prefix_instruction
+                logger.info(f"[프리픽스] 지시문 베이스 프롬프트 앞에 삽입 예정 (total={_prefix_count})")
+        elif "{{prefix_instruction}}" in final_prompt:
+            final_prompt = final_prompt.replace("{{prefix_instruction}}", "")
+            logger.debug("[프리픽스] 비활성화 — {{prefix_instruction}} 제거")
+
+        # [컨텍스트 주입 모드]
+        if self.config.get("enable_context_injection", False):
+            ctx = context_text or "No previous context available."
+            ctx_preview = ctx[:80].replace('\n', '↵') + ("..." if len(ctx) > 80 else "")
+            context_block = (
+                f"{self._CONTEXT_PREAMBLE}"
+                f"{self._CONTEXT_HEADER}\n"
+                f"{ctx}\n"
+                f"{self._CONTEXT_FOOTER}\n\n"
+            )
+            if "{{context}}" in final_prompt:
+                final_prompt = final_prompt.replace("{{context}}", context_block)
+                logger.info(f"[컨텍스트] {{{{context}}}} 치환 완료 ({len(ctx)}자): {ctx_preview}")
+            else:
+                prepend_context = context_block
+                logger.info(f"[컨텍스트] 컨텍스트 블록 베이스 프롬프트 앞에 삽입 예정 ({len(ctx)}자): {ctx_preview}")
+        elif "{{context}}" in final_prompt:
+            final_prompt = final_prompt.replace("{{context}}", "")
+            logger.debug("[컨텍스트] 비활성화 — {{context}} 제거")
+
+        # prepend: PREFIX → CONTEXT → BASE
+        if prepend_prefix or prepend_context:
+            final_prompt = prepend_prefix + prepend_context + final_prompt
 
         # Determine the source language for the current chunk to filter glossary entries
         config_source_lang = self.config.get("novel_language") # 통합된 설정 사용
@@ -292,7 +367,8 @@ class TranslationService:
     async def translate_chunk_async(
         self,
         chunk_text: str,
-        stream: bool = False
+        stream: bool = False,
+        context_text: str = ""
     ) -> str:
         """
         비동기 청크 번역 메서드 (진정한 비동기 구현)
@@ -335,11 +411,11 @@ class TranslationService:
             # 설정에 따라 재시도 로직 분기
             if use_content_safety_retry:
                 result = await self.translate_text_with_content_safety_retry_async(
-                    chunk_text, max_split_attempts, min_chunk_size
+                    chunk_text, max_split_attempts, min_chunk_size, context_text=context_text
                 )
             else:
                 # 재시도 없이 직접 번역 (OFF 설정 시)
-                result = await self.translate_text_async(chunk_text)
+                result = await self.translate_text_async(chunk_text, context_text=context_text)
             
             # 📍 중단 체크: API 응답 후
             if self.stop_check_callback and self.stop_check_callback():
@@ -367,7 +443,7 @@ class TranslationService:
     # 비동기 메서드 (Phase 2: asyncio 마이그레이션)
     # ============================================================================
 
-    async def translate_text_async(self, text_chunk: str, stream: bool = False) -> str:
+    async def translate_text_async(self, text_chunk: str, stream: bool = False, context_text: str = "") -> str:
         """
         비동기 텍스트 번역 메서드 (translate_text의 비동기 버전)
         
@@ -454,15 +530,22 @@ class TranslationService:
                     )
             else:
                 api_prompt_for_gemini_client = injected_history
-                user_prompt_str = self._construct_prompt(text_chunk)
+                user_prompt_str = self._construct_prompt(text_chunk, context_text)
                 api_prompt_for_gemini_client.append(
                     genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=user_prompt_str)])
                 )
         else:
-            user_prompt_str = self._construct_prompt(text_chunk)
+            user_prompt_str = self._construct_prompt(text_chunk, context_text)
             api_prompt_for_gemini_client = [
                 genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=user_prompt_str)])
             ]
+
+        if self.config.get("enable_verbose_translation_log", False) and user_prompt_str:
+            logger.info(
+                f"[상세로그] ===== 전송 프롬프트 ({len(user_prompt_str)}자) =====\n"
+                f"{user_prompt_str}\n"
+                f"[상세로그] ===== 프롬프트 끝 ====="
+            )
 
         try:
             translated_text_from_api = await self.gemini_client.generate_text_async(
@@ -484,6 +567,13 @@ class TranslationService:
             if not translated_text_from_api.strip() and text_chunk.strip():
                 raise GeminiContentSafetyException("API가 비어있지 않은 입력에 대해 빈 번역 결과를 반환했습니다.")
 
+            if self.config.get("enable_verbose_translation_log", False):
+                logger.info(
+                    f"[상세로그] ===== API 원본 응답 ({len(translated_text_from_api)}자) =====\n"
+                    f"{translated_text_from_api}\n"
+                    f"[상세로그] ===== 응답 끝 ====="
+                )
+
             return translated_text_from_api.strip()
 
         except asyncio.CancelledError:
@@ -503,10 +593,11 @@ class TranslationService:
             raise BtgTranslationException(f"번역 중 알 수 없는 오류가 발생했습니다: {e}", original_exception=e) from e
 
     async def translate_text_with_content_safety_retry_async(
-        self, 
-        text_chunk: str, 
+        self,
+        text_chunk: str,
         max_split_attempts: int = 3,
-        min_chunk_size: int = 100
+        min_chunk_size: int = 100,
+        context_text: str = ""
     ) -> str:
         """
         비동기 버전: 콘텐츠 안전 오류 발생시 청크를 분할하여 재시도하는 번역 메서드
@@ -520,14 +611,14 @@ class TranslationService:
             번역된 텍스트 (실패한 부분은 오류 메시지로 대체)
         """
         try:
-            return await self.translate_text_async(text_chunk)
+            return await self.translate_text_async(text_chunk, context_text=context_text)
         except BtgTranslationException as e:
             if not ("콘텐츠 안전 문제" in str(e)):
                 raise e
-            
+
             logger.warning(f"콘텐츠 안전 문제 감지. 비동기 청크 분할 재시도 시작: {str(e)}")
             return await self._translate_with_recursive_splitting_async(
-                text_chunk, max_split_attempts, min_chunk_size, current_attempt=1
+                text_chunk, max_split_attempts, min_chunk_size, current_attempt=1, context_text=context_text
             )
 
     async def _translate_with_recursive_splitting_async(
@@ -535,7 +626,8 @@ class TranslationService:
         text_chunk: str,
         max_split_attempts: int,
         min_chunk_size: int,
-        current_attempt: int = 1
+        current_attempt: int = 1,
+        context_text: str = ""
     ) -> str:
         if current_attempt > max_split_attempts:
             logger.error(f"최대 분할 시도 횟수({max_split_attempts})에 도달. 번역 실패.")
@@ -584,7 +676,7 @@ class TranslationService:
                 if self.stop_check_callback and self.stop_check_callback():
                     raise asyncio.CancelledError(f"서브 청크 {idx+1} 번역 중단 요청됨 (API 호출 직전)")
                 
-                translated = await self.translate_text_async(sub_chunk)
+                translated = await self.translate_text_async(sub_chunk, context_text=context_text)
                 logger.info(f"   ✅ 서브 청크 {idx+1}/{len(sub_chunks)} 번역 완료")
                 return (idx, translated)
                 
@@ -595,7 +687,7 @@ class TranslationService:
                 if "콘텐츠 안전 문제" in str(e_sub) and current_attempt < max_split_attempts:
                     logger.warning(f"   🛡️ 서브 청크 {idx+1} 콘텐츠 안전 오류. 재귀 분할 시도.")
                     recursive_result = await self._translate_with_recursive_splitting_async(
-                        sub_chunk, max_split_attempts, min_chunk_size, current_attempt + 1
+                        sub_chunk, max_split_attempts, min_chunk_size, current_attempt + 1, context_text=context_text
                     )
                     return (idx, recursive_result)
                 else:

@@ -672,14 +672,14 @@ class ReviewTabQt(QtWidgets.QWidget):
         async def _translate_one(chunk_idx: int) -> None:
             async with semaphore:
                 self._set_status(
-                    f"재번역 중 ({self._retranslate_done}/{self._retranslate_total}) — 청크 #{chunk_idx} 처리 중"
+                    f"{self._retranslate_done}/{self._retranslate_total} 재번역중"
                 )
                 logger.info(f"재번역 시작 청크 #{chunk_idx} ({self._retranslate_done}/{self._retranslate_total})")
 
                 chunk_file_path = self._get_translated_chunked_file_path(self.current_input_file)
 
                 def progress_cb(msg: str, _idx=chunk_idx) -> None:
-                    self.status_signal.emit(f"청크#{_idx}: {msg}")
+                    logger.debug(f"청크#{_idx}: {msg}")
 
                 try:
                     success, result = await self.app_service.translate_single_chunk_async(
@@ -703,7 +703,7 @@ class ReviewTabQt(QtWidgets.QWidget):
                     logger.warning(f"청크 #{chunk_idx} 실패: {result}")
 
                 self._set_status(
-                    f"재번역 중 ({self._retranslate_done}/{self._retranslate_total})"
+                    f"{self._retranslate_done}/{self._retranslate_total} 재번역중"
                 )
 
         try:

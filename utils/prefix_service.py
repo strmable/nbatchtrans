@@ -77,7 +77,7 @@ class PrefixService:
                 metadata_list.append(LineMetadata(
                     prefix_num=None,
                     global_line_number=global_line_number,
-                    original_text=line_content,
+                    original_text="" if line_content.strip() else line_content,
                     is_empty=True,
                 ))
                 prefixed_lines.append(newline_suffix or '\n')
